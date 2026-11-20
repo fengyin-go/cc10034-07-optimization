@@ -9,6 +9,21 @@ from datetime import datetime
 from typing import Any
 
 
+def parse_moment(value: str | datetime, *, end_of_day: bool = False) -> datetime:
+    """归一化时间入参：支持日期串（按当日起点/终点）或完整 ISO 串。
+
+    生效区间查询必须先把「日期」归一到边界时刻，否则字符串比较会把
+    区间末端当天内的记录漏掉（如 '2026-09-05T10:00:00' > '2026-09-05'）。
+    """
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return datetime.fromisoformat(
+            f"{text}T23:59:59.999999" if end_of_day else f"{text}T00:00:00")
+    return datetime.fromisoformat(text)
+
+
 @dataclass
 class ChangeEventRecord:
     """变更事件统一结构。"""
@@ -29,7 +44,14 @@ class ChangeEventRecord:
 
 @dataclass
 class DdlRecord:
-    """DDL 变更结构。"""
+    """DDL 变更结构。
+
+    双时间轴：
+    - executed_at   生效时间（valid time）：变更在源表生效的时刻，用于生效区间查询
+    - registered_at 登记时间（transaction time）：日志进入中心的时刻
+    - revision      登记版本号：由管道总线单调递增分配，作为查询/同步共用的版本边界
+    迟到更正常见形态：executed_at 落在历史区间，revision 却晚于已钉住的查询窗口。
+    """
     record_id: str
     database: str
     table_name: str
@@ -39,6 +61,15 @@ class DdlRecord:
     rollback_statement: str
     column_changes: list[dict[str, Any]] = field(default_factory=list)
     partition_changes: list[dict[str, Any]] = field(default_factory=list)
+    registered_at: datetime | None = None
+    revision: int = 0
+    source: str = "manual"
+    corrects: str | None = None  # 指向被更正记录的 record_id
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        """完整表身份：库 + 表，缺一则可能串到同名表。"""
+        return (self.database, self.table_name)
 
 
 @dataclass
@@ -77,6 +108,15 @@ class PipelineBus:
         self.event_log: list[dict[str, Any]] = []
         # DDL 记录 — ddl_tracker 产出，schema_sync/partition_sync 消费
         self.ddl_log: list[DdlRecord] = []
+        # DDL 登记版本号：单调递增，作为查询与同步共用的版本边界
+        self.ddl_revision: int = 0
+        # DDL 按完整表身份 (库, 表) 建索引：检索只扫描目标表桶，不翻无关表
+        self.ddl_index: dict[tuple[str, str], list[DdlRecord]] = defaultdict(list)
+        # 来源水位：source -> 已连续到达的生效时间上限（ISO 字符串），用于识别资料缺口
+        self.source_watermarks: dict[str, str | None] = {}
+        # 已钉住版本边界的历史查询会话：query_id -> 查询上下文，
+        # 跨服务共享（ddl_tracker 钉口径，schema_sync 按同一边界消费）
+        self.history_queries: dict[str, dict[str, Any]] = {}
         # 位点注册 — checkpoint_manager/position_store 写入，cdc_channel/failover_group 消费
         self.positions: dict[str, PositionSnapshot] = {}
         self.checkpoints: list[CheckpointRecord] = []
@@ -150,12 +190,78 @@ class PipelineBus:
         return abs(source_pos.position - target_pos.position)
 
     def add_ddl(self, ddl: DdlRecord) -> None:
-        """添加 DDL 记录。"""
+        """添加 DDL 记录：分配登记版本号并按完整表身份入索引。"""
+        self.ddl_revision += 1
+        ddl.revision = self.ddl_revision
+        if ddl.registered_at is None:
+            ddl.registered_at = datetime.now()
         self.ddl_log.append(ddl)
+        self.ddl_index[ddl.identity].append(ddl)
+        self.source_watermarks.setdefault(ddl.source, None)
 
     def get_recent_ddls(self, limit: int = 50) -> list[DdlRecord]:
         """查询最近 DDL 记录。"""
         return self.ddl_log[-limit:]
+
+    def current_ddl_revision(self) -> int:
+        """当前登记版本号：查询开启时钉住它，翻页与同步都读同一边界。"""
+        return self.ddl_revision
+
+    def query_ddl_history(
+        self,
+        database: str,
+        table_name: str,
+        from_dt: datetime,
+        to_dt: datetime,
+        as_of_revision: int | None = None,
+    ) -> list[DdlRecord]:
+        """按完整表身份 + 生效区间查询 DDL 历史（结构历史数据集的底表）。
+
+        - 只扫描 (database, table_name) 索引桶，无关表不参与过滤；
+          单表记录全量覆盖，不受最近 N 条窗口截断。
+        - as_of_revision 为版本边界：只可见 revision <= 边界的记录，
+          并发写入的迟到日志不会挤进已钉住的查询。
+        - 更正口径：可见的更正记录顶替其指向的原始记录（追溯重述）；
+          更正晚于版本边界时，原始记录维持原结论。
+        返回按 (生效时间, 登记版本) 排序的稳定序列。
+        """
+        revision_cap = self.ddl_revision if as_of_revision is None else as_of_revision
+        bucket = self.ddl_index.get((database, table_name), [])
+        visible = [
+            ddl for ddl in bucket
+            if ddl.revision <= revision_cap
+            and from_dt <= ddl.executed_at <= to_dt
+        ]
+        superseded = {ddl.corrects for ddl in visible if ddl.corrects}
+        effective = [ddl for ddl in visible if ddl.record_id not in superseded]
+        effective.sort(key=lambda ddl: (ddl.executed_at, ddl.revision))
+        return effective
+
+    def advance_source_watermark(self, source: str, watermark: str | datetime) -> None:
+        """推进来源水位：声明该来源 watermark 之前的生效区间已经到齐。"""
+        self.source_watermarks[source] = parse_moment(watermark).isoformat()
+
+    def ddl_coverage(self, database: str, table_name: str,
+                     from_dt: datetime, to_dt: datetime) -> dict[str, Any]:
+        """查询区间的资料到达情况。
+
+        期望来源 = 该表身份出现过来报的来源。水位未覆盖到区间末端的来源
+        记为「未到」：缺口不等于没有改列，下游不得按无变更处理。
+        """
+        expected = {
+            ddl.source for ddl in self.ddl_index.get((database, table_name), [])
+        }
+        watermarks = {src: self.source_watermarks.get(src) for src in sorted(expected)}
+        missing = [
+            src for src, mark in watermarks.items()
+            if mark is None or parse_moment(mark) < to_dt
+        ]
+        return {
+            "complete": not missing,
+            "missing_sources": missing,
+            "watermarks": watermarks,
+            "range": {"from": from_dt.isoformat(), "to": to_dt.isoformat()},
+        }
 
     def compute_event_hash(self, event: ChangeEventRecord) -> str:
         """计算事件的业务去重哈希。"""
@@ -320,6 +426,9 @@ class PipelineBus:
             "pipeline_metrics": dict(self.pipeline_metrics),
             "queue_depth": len(self.event_queue),
             "ddl_count": len(self.ddl_log),
+            "ddl_revision": self.ddl_revision,
+            "ddl_index_keys": len(self.ddl_index),
+            "source_watermark_count": len(self.source_watermarks),
             "position_count": len(self.positions),
             "checkpoint_count": len(self.checkpoints),
             "register_count": len(self.schema_registry),

@@ -16,9 +16,11 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/history.py   结构历史数据集检索与同步计划接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
-│   └── app/store.py          内存数据仓库与示例数据
+│   ├── app/store.py          内存数据仓库与示例数据
+│   └── tests/test_ddl_history.py  DDL历史口径核对脚本
 ├── .gitignore
 └── docker-compose.yml
 ```
@@ -76,6 +78,27 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## DDL历史检索与同步口径
+
+DDL追踪按完整表身份（库+表）建索引，结构变更日志按生效区间查询为
+**结构历史数据集**；一次检索钉住一个登记版本号作为版本边界，翻页期间成员
+与顺序稳定，并发写入的迟到日志不会跳进已钉住的分页。
+
+- `GET /api/ddl_tracker/history?database=&table=&start=&end=&page=&size=&query_id=`
+  结构历史数据集分页检索；首页返回 `query_id`，翻页带上它即复用同一版本边界。
+- `POST /api/ddl_tracker/history/register`
+  登记DDL日志：`executed_at` 传历史生效时间即为迟到日志，`corrects`
+  指向被更正记录。更正在新口径查询中追溯重述历史，已钉住的查询维持原结论。
+- `GET /api/schema_sync/{id}/plan?mode=stored|as_of|latest|history`
+  同步计划清单：变更清单与列映射取自同一份数据集（共用修订口径），校验结果
+  回写同步清单；`as_of` 按当时口径重算已交付产物，`latest` 按最新口径再次交付，
+  `history` 列出全部交付版本。
+
+资料不全的区间在数据集 `coverage` 中标注未到来源（`missing_sources`），
+同步校验记为「资料不全」，不把缺口当作没有改列。
+
+核对脚本：`backend/.venv/bin/python tests/test_ddl_history.py`
 
 领域：数据工程
 子方向：数仓与数据湖
